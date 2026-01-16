@@ -46,6 +46,10 @@ impl BrowserSession {
         // This prevents "server-grade" leaks (96 CPUs, 64GB RAM on a "laptop")
         Self::inject_bio_bios(&tab)?;
 
+        // CRITICAL: Inject DBI hooks for Canvas/WebGL entropy
+        // This adds session-unique noise to prevent canvas fingerprinting
+        crate::dbi::initialize_dbi(None).inject_hooks(&tab)?;
+
         Ok(Self {
             browser,
             session_id,
@@ -85,24 +89,35 @@ impl BrowserSession {
                 }
             });
             
-            // MASK WEBGL VENDOR (Hide that we are using a Linux Server GPU/SwiftShader)
-            // This prevents GPU fingerprinting from revealing server hardware
-            const getParameter = WebGLRenderingContext.prototype.getParameter;
+            // Native CDP Override: Hardcode WebGL Vendor and Renderer
+            // This ensures the sanitized binary reports authentic consumer hardware
+            // even in a virtualized container environment.
+            // 
+            // Success Criterion:
+            // - Vendor: "Intel Inc."
+            // - Renderer: "Intel(R) Iris(R) Xe Graphics"
+            //
+            // This prevents GPU fingerprinting from revealing server hardware (SwiftShader/Linux GPU)
+            const originalGetParameter = WebGLRenderingContext.prototype.getParameter;
             WebGLRenderingContext.prototype.getParameter = function(parameter) {
-                // UNMASKED_VENDOR_WEBGL (0x9245)
-                if (parameter === 37445) return "Intel Inc."; 
-                // UNMASKED_RENDERER_WEBGL (0x9246)
-                if (parameter === 37446) return "Intel(R) Iris(R) Xe Graphics"; 
-                return getParameter.call(this, parameter);
+                // UNMASKED_VENDOR_WEBGL (0x9245 = 37445)
+                if (parameter === 37445) {
+                    return "Intel Inc.";
+                }
+                // UNMASKED_RENDERER_WEBGL (0x9246 = 37446)
+                if (parameter === 37446) {
+                    return "Intel(R) Iris(R) Xe Graphics";
+                }
+                return originalGetParameter.call(this, parameter);
             };
             
-            // Also mask WebGL2
+            // Also override WebGL2 (if available)
             if (typeof WebGL2RenderingContext !== 'undefined') {
-                const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+                const originalGetParameter2 = WebGL2RenderingContext.prototype.getParameter;
                 WebGL2RenderingContext.prototype.getParameter = function(parameter) {
                     if (parameter === 37445) return "Intel Inc.";
                     if (parameter === 37446) return "Intel(R) Iris(R) Xe Graphics";
-                    return getParameter2.call(this, parameter);
+                    return originalGetParameter2.call(this, parameter);
                 };
             }
         "#;

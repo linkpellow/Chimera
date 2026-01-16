@@ -117,4 +117,24 @@ message CoordinateResponse {
     int32 width = 4;
     int32 height = 5;
     float confidence = 6;
+    // Phase 3: Behavioral Constraint from Brain
+    // When the Brain tells the Body to "Click the Search Bar," it will also
+    // include a precision value. High-trust targets will require "Lower Precision"
+    // (more human-like inaccuracy) during the initial movement.
+    optional BehavioralConstraint behavioral_constraint = 7;
+}
+
+message BehavioralConstraint {
+    // Precision value: 0.0 = low precision (more human-like inaccuracy),
+    // 1.0 = high precision (more accurate, less human-like)
+    // Default: 0.3 (30% precision = 70% human-like)
+    float precision = 1;
+    
+    // Whether to use overshoot and correction pattern (typical of human motor control)
+    // Default: true
+    bool use_overshoot = 2;
+    
+    // Maximum jitter offset in pixels (for Gaussian jitter)
+    // Default: 5.0 pixels
+    float max_jitter = 3;
 }

@@ -106,8 +106,14 @@ pub struct BrowserFingerprint {
 /// Manages synthetic browser profiles stored in Redis or filesystem.
 /// When launching a worker, it "grafts" an existing profile instead of
 /// creating a fresh browser.
+/// 
+/// The "Lived-In" Identity Grafting:
+/// To reach the End Goal, we must move beyond a "clean" browser and create
+/// an "authentic" one. Workers pull "Synthetic Profiles" (cookies, history,
+/// and cache) from Redis so that every worker arrives at the target site
+/// with a "history," bypassing "New User" suspicion algorithms.
 pub struct IdentityGrafting {
-    /// Profile storage directory
+    /// Profile storage directory (for filesystem fallback)
     profiles_dir: PathBuf,
     
     /// Active profiles cache
@@ -115,11 +121,18 @@ pub struct IdentityGrafting {
     
     /// Profile rotation index
     rotation_index: usize,
+    
+    /// Redis connection URL (optional - for swarm profile sharing)
+    redis_url: Option<String>,
 }
 
 impl IdentityGrafting {
     /// Create a new Identity Grafting manager
-    pub fn new(profiles_dir: impl AsRef<Path>) -> Result<Self> {
+    /// 
+    /// Args:
+    ///   - profiles_dir: Directory for filesystem storage (fallback)
+    ///   - redis_url: Optional Redis URL for swarm profile sharing
+    pub fn new(profiles_dir: impl AsRef<Path>, redis_url: Option<String>) -> Result<Self> {
         let profiles_dir = profiles_dir.as_ref().to_path_buf();
         
         // Create directory if it doesn't exist
@@ -130,21 +143,47 @@ impl IdentityGrafting {
             profiles_dir,
             profiles: HashMap::new(),
             rotation_index: 0,
+            redis_url,
         };
         
-        // Load existing profiles
+        // Load existing profiles (from Redis if available, otherwise filesystem)
         manager.load_profiles()?;
         
         info!("Identity Grafting initialized with {} profiles", manager.profiles.len());
+        if manager.redis_url.is_some() {
+            info!("Profile storage: Redis (swarm sharing enabled)");
+        } else {
+            info!("Profile storage: Filesystem (local only)");
+        }
         
         Ok(manager)
     }
     
     /// Load profiles from storage
+    /// 
+    /// Priority:
+    /// 1. Redis (if redis_url is set) - for swarm profile sharing
+    /// 2. Filesystem (fallback) - for local development
     fn load_profiles(&mut self) -> Result<()> {
-        // In production, this would load from Redis
-        // For now, load from filesystem
+        // Try Redis first if configured
+        if let Some(ref redis_url) = self.redis_url {
+            match self.load_profiles_from_redis(redis_url) {
+                Ok(count) => {
+                    if count > 0 {
+                        info!("Loaded {} profiles from Redis", count);
+                        return Ok(());
+                    }
+                    // Fall through to filesystem if Redis is empty
+                    debug!("Redis has no profiles, falling back to filesystem");
+                }
+                Err(e) => {
+                    warn!("Failed to load profiles from Redis: {}, falling back to filesystem", e);
+                    // Fall through to filesystem
+                }
+            }
+        }
         
+        // Load from filesystem (fallback or if Redis not configured)
         let profiles_file = self.profiles_dir.join("profiles.json");
         if profiles_file.exists() {
             let content = std::fs::read_to_string(&profiles_file)
@@ -157,11 +196,105 @@ impl IdentityGrafting {
                 self.profiles.insert(profile.id.clone(), profile);
             }
             
-            debug!("Loaded {} profiles from storage", self.profiles.len());
+            debug!("Loaded {} profiles from filesystem", self.profiles.len());
         } else {
             // Create default profiles if none exist
             self.create_default_profiles()?;
         }
+        
+        Ok(())
+    }
+    
+    /// Load profiles from Redis
+    /// 
+    /// This implements "Lived-In" Identity Grafting by pulling synthetic profiles
+    /// (cookies, history, cache) from Redis so every worker arrives with a "history."
+    /// 
+    /// Profile Swapping: Workers pull a persistent Browser Context (cookies,
+    /// localStorage, and session cache) from Redis on startup.
+    fn load_profiles_from_redis(&mut self, redis_url: &str) -> Result<usize> {
+        use redis::AsyncCommands;
+        
+        // Create Redis client
+        let client = redis::Client::open(redis_url)
+            .context("Failed to create Redis client")?;
+        
+        // Get async connection (requires tokio runtime)
+        let rt = tokio::runtime::Handle::try_current()
+            .context("Redis requires tokio runtime")?;
+        
+        let count = rt.block_on(async {
+            let mut conn = client.get_async_connection().await
+                .context("Failed to connect to Redis")?;
+            
+            // Get all profile keys
+            let keys: Vec<String> = conn.keys("profile:*").await
+                .context("Failed to get profile keys from Redis")?;
+            
+            let mut loaded = 0;
+            for key in keys {
+                match conn.get::<_, String>(&key).await {
+                    Ok(profile_json) => {
+                        match serde_json::from_str::<SyntheticProfile>(&profile_json) {
+                            Ok(profile) => {
+                                self.profiles.insert(profile.id.clone(), profile);
+                                loaded += 1;
+                                debug!("Loaded profile from Redis: {}", key);
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse profile from Redis key {}: {}", key, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to get profile from Redis key {}: {}", key, e);
+                    }
+                }
+            }
+            
+            Ok::<usize, anyhow::Error>(loaded)
+        })?;
+        
+        Ok(count)
+    }
+    
+    /// Save profile to Redis (for swarm sharing)
+    /// 
+    /// Pre-Warming: If a worker encounters a "New User" flag, it must push
+    /// its current state to Redis so that subsequent workers can inherit
+    /// that "warmed" session.
+    /// 
+    /// When a profile is used, update it in Redis so other workers can benefit
+    /// from the "lived-in" history (cookies, cache, visit history).
+    fn save_profile_to_redis(&self, profile: &SyntheticProfile) -> Result<()> {
+        use redis::AsyncCommands;
+        
+        let redis_url = self.redis_url.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Redis URL not configured"))?;
+        
+        // Create Redis client
+        let client = redis::Client::open(redis_url)
+            .context("Failed to create Redis client")?;
+        
+        // Get async connection
+        let rt = tokio::runtime::Handle::try_current()
+            .context("Redis requires tokio runtime")?;
+        
+        rt.block_on(async {
+            let mut conn = client.get_async_connection().await
+                .context("Failed to connect to Redis")?;
+            
+            let key = format!("profile:{}", profile.id);
+            let profile_json = serde_json::to_string(profile)
+                .context("Failed to serialize profile")?;
+            
+            // Save profile to Redis with expiration (30 days)
+            conn.set_ex::<_, _, ()>(&key, &profile_json, 30 * 24 * 60 * 60).await
+                .context("Failed to save profile to Redis")?;
+            
+            debug!("Saved profile to Redis: {}", key);
+            Ok::<(), anyhow::Error>(())
+        })?;
         
         Ok(())
     }
@@ -339,6 +472,9 @@ impl IdentityGrafting {
     }
     
     /// Update profile after use
+    /// 
+    /// Updates the profile's last_used timestamp and increments usage metrics.
+    /// If Redis is configured, also saves the updated profile to Redis for swarm sharing.
     pub fn update_profile(&mut self, profile_id: &str) -> Result<()> {
         if let Some(profile) = self.profiles.get_mut(profile_id) {
             let now = std::time::SystemTime::now()
@@ -348,7 +484,17 @@ impl IdentityGrafting {
             
             profile.metadata.last_used = now;
             // Increment cache size, cookie count, etc.
+            profile.cache_size_mb = profile.cache_size_mb.saturating_add(1);
+            profile.cookie_count = profile.cookie_count.saturating_add(1);
             
+            // Save to Redis if configured (for swarm sharing)
+            if self.redis_url.is_some() {
+                if let Err(e) = self.save_profile_to_redis(profile) {
+                    warn!("Failed to save profile to Redis (non-fatal): {}", e);
+                }
+            }
+            
+            // Also save to filesystem (backup)
             self.save_profiles()?;
         }
         

@@ -43,6 +43,7 @@ FROM debian:bookworm-slim
 # 1. Install Chrome & Certificates (CRITICAL)
 # We need actual Chromium for the Rust driver to control.
 # Also need ca-certificates for HTTPS and libssl3 for reqwest-impersonate
+# Python3 is needed for binary sanitization script
 RUN apt-get update && apt-get install -y \
     chromium \
     chromium-sandbox \
@@ -63,7 +64,18 @@ RUN apt-get update && apt-get install -y \
     libasound2 \
     libpango-1.0-0 \
     libcairo2 \
+    python3 \
     && rm -rf /var/lib/apt/lists/*
+
+# Stage: Binary Sanitization (Apex Binary Sanitization)
+# The browser must be lobotomized as part of the container's birth to ensure
+# the "Body" (chimera-core) only ever sees a clean engine.
+# 
+# This rewrites the browser binary during the Docker build process to permanently
+# scrub the "automation DNA" from its machine code. We do NOT patch at runtime
+# with scripts - we rewrite the binary itself.
+COPY chimera-core/scripts/sanitize_binary.py /app/scripts/
+RUN python3 /app/scripts/sanitize_binary.py
 
 WORKDIR /app
 

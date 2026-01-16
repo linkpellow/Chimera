@@ -12,7 +12,11 @@ use headless_chrome::Tab;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+use rand::Rng;
+use rand_distr::{Normal, Distribution};
+use std::time::Duration;
+use tokio::time::sleep;
 
 /// Accessibility Tree Node - The "Truth" of page structure
 /// 
@@ -213,6 +217,262 @@ impl Cortex {
         Ok(())
     }
     
+    /// Verify Engine Health - Native Engine Verification
+    /// 
+    /// Modern anti-bot suites in 2026 use Function Integrity Checks.
+    /// They call toString() on properties to see if they've been wrapped by a "stealth" proxy.
+    /// If it doesn't return the native C++ code signature, you are flagged.
+    /// 
+    /// This method verifies that the binary sanitization was successful by checking
+    /// the typeof navigator.webdriver. The engine is considered "dirty" if:
+    /// - typeof returns "boolean" (native automation flag)
+    /// - typeof returns anything other than "undefined"
+    /// 
+    /// Success Criterion: 
+    /// - If typeof returns "boolean" or "true" → engine is DIRTY (fail-fast)
+    /// - If typeof returns "undefined" → binary is successfully sanitized
+    pub fn verify_engine_health(&self) -> Result<bool> {
+        info!("🔍 Verifying engine health (native engine verification)...");
+        
+        // Execute raw JS probe: return typeof navigator.webdriver
+        // This checks the native property, not a wrapped proxy
+        let check_script = r#"
+            (function() {
+                // Direct typeof check - no wrapping, no proxies
+                const type = typeof navigator.webdriver;
+                const value = navigator.webdriver;
+                
+                // Also check toString() to detect Function Integrity violations
+                // If webdriver exists, check if it's been wrapped
+                let toStringResult = null;
+                try {
+                    if (navigator.webdriver !== undefined) {
+                        toStringResult = Object.getOwnPropertyDescriptor(navigator, 'webdriver')?.get?.toString();
+                    }
+                } catch (e) {
+                    toStringResult = 'error: ' + e.message;
+                }
+                
+                return {
+                    type: type,
+                    value: value,
+                    isUndefined: type === 'undefined',
+                    isBoolean: type === 'boolean',
+                    isDirty: type === 'boolean' || (type !== 'undefined' && value === true),
+                    toStringSignature: toStringResult
+                };
+            })();
+        "#;
+        
+        let result = self.tab
+            .evaluate(check_script, false)
+            .context("Failed to execute engine health check")?;
+        
+        // Parse the result
+        let result_obj = result.value.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("No result from engine health check"))?;
+        
+        let type_str = result_obj
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        
+        let is_undefined = result_obj
+            .get("isUndefined")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        
+        let is_boolean = result_obj
+            .get("isBoolean")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        
+        let is_dirty = result_obj
+            .get("isDirty")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        
+        let value = result_obj
+            .get("value")
+            .and_then(|v| {
+                if v.is_boolean() {
+                    Some(v.as_bool().unwrap().to_string())
+                } else if v.is_null() {
+                    Some("null".to_string())
+                } else {
+                    v.as_str().map(|s| s.to_string())
+                }
+            })
+            .unwrap_or_else(|| "unknown".to_string());
+        
+        let toString_sig = result_obj
+            .get("toStringSignature")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        
+        // Success Criterion: Engine is DIRTY if:
+        // 1. typeof returns "boolean" (native automation flag)
+        // 2. typeof returns anything other than "undefined"
+        // 3. value is true (automation enabled)
+        if is_dirty || is_boolean || !is_undefined {
+            error!(
+                "❌ ENGINE HEALTH CHECK FAILED: Engine is DIRTY (not sanitized)"
+            );
+            error!(
+                "   - typeof navigator.webdriver: '{}' (expected: 'undefined')",
+                type_str
+            );
+            error!(
+                "   - Value: {}",
+                value
+            );
+            if let Some(sig) = toString_sig {
+                error!(
+                    "   - toString() signature: {}",
+                    sig
+                );
+                if !sig.contains("native code") && !sig.contains("[native code]") {
+                    error!(
+                        "   - ⚠️  WARNING: toString() does not show native code - property may be wrapped!"
+                    );
+                }
+            }
+            error!(
+                "   - Status: Engine has NOT been properly sanitized"
+            );
+            error!(
+                "   - Action: Binary sanitization failed or was bypassed"
+            );
+            return Ok(false);
+        }
+        
+        // Additional check: If toString signature exists and doesn't show native code, it's wrapped
+        if let Some(sig) = &toString_sig {
+            if !sig.contains("native code") && !sig.contains("[native code]") && !sig.contains("error") {
+                warn!(
+                    "⚠️  WARNING: navigator.webdriver toString() signature suggests wrapping: {}",
+                    sig
+                );
+                warn!(
+                    "   This may indicate Function Integrity Check failure"
+                );
+            }
+        }
+        
+        info!("✅ Engine health verified: Binary is successfully sanitized");
+        info!("   - typeof navigator.webdriver: '{}' (clean)", type_str);
+        info!("   - Value: undefined (clean)");
+        if let Some(sig) = toString_sig {
+            info!("   - toString() signature: {} (native)", sig);
+        }
+        info!("   - Status: Engine DNA is clean - ready for missions");
+        
+        // Phase 2: Verify Redis Session is correctly mounted
+        // This ensures "Lived-In" Identity Grafting is active
+        if let Err(e) = self.verify_redis_session() {
+            warn!("⚠️  Redis session verification failed (non-fatal): {}", e);
+            warn!("   Profiles will use filesystem fallback");
+        } else {
+            info!("✅ Redis session verified: Identity Grafting active");
+        }
+        
+        Ok(true)
+    }
+    
+    /// Verify Redis Session is correctly mounted
+    /// 
+    /// Success Criterion: A new worker container must be able to resume a session
+    /// on a target site (e.g., stay logged in) without re-authenticating, proving
+    /// that the Identity Grafting is seamless.
+    fn verify_redis_session(&self) -> Result<()> {
+        // Check if Redis is configured via environment variable
+        let redis_url = std::env::var("REDIS_URL")
+            .or_else(|_| std::env::var("CHIMERA_REDIS_URL"))
+            .ok();
+        
+        if redis_url.is_none() {
+            debug!("Redis not configured (REDIS_URL or CHIMERA_REDIS_URL not set)");
+            return Ok(()); // Not an error, just not using Redis
+        }
+        
+        // Try to connect to Redis and verify profile store is accessible
+        let redis_url = redis_url.unwrap();
+        
+        // Use tokio runtime handle if available, otherwise create new runtime
+        let rt = tokio::runtime::Handle::try_current();
+        
+        if let Ok(handle) = rt {
+            // We're in an async context, use the handle
+            handle.block_on(async {
+                use redis::AsyncCommands;
+                
+                let client = redis::Client::open(&redis_url)
+                    .context("Failed to create Redis client")?;
+                
+                let mut conn = client.get_async_connection().await
+                    .context("Failed to connect to Redis")?;
+                
+                // Check if Redis is accessible
+                let _: String = conn.ping().await
+                    .context("Redis ping failed")?;
+                
+                // Check if profile keys exist
+                let keys: Vec<String> = conn.keys("profile:*").await
+                    .context("Failed to check profile keys")?;
+                
+                let profile_count = keys.len();
+                
+                if profile_count > 0 {
+                    info!("Redis session verified: {} profiles available", profile_count);
+                } else {
+                    warn!("Redis session verified but no profiles found (will create defaults)");
+                }
+                
+                Ok::<(), anyhow::Error>(())
+            })?;
+        } else {
+            // Not in async context, create temporary runtime
+            let rt = tokio::runtime::Runtime::new()
+                .context("Failed to create tokio runtime for Redis")?;
+            
+            rt.block_on(async {
+                use redis::AsyncCommands;
+                
+                let client = redis::Client::open(&redis_url)
+                    .context("Failed to create Redis client")?;
+                
+                let mut conn = client.get_async_connection().await
+                    .context("Failed to connect to Redis")?;
+                
+                // Check if Redis is accessible
+                let _: String = conn.ping().await
+                    .context("Redis ping failed")?;
+                
+                // Check if profile keys exist
+                let keys: Vec<String> = conn.keys("profile:*").await
+                    .context("Failed to check profile keys")?;
+                
+                let profile_count = keys.len();
+                
+                if profile_count > 0 {
+                    info!("Redis session verified: {} profiles available", profile_count);
+                } else {
+                    warn!("Redis session verified but no profiles found (will create defaults)");
+                }
+                
+                Ok::<(), anyhow::Error>(())
+            })?;
+        }
+        
+        Ok(())
+    }
+    }
+    
+    /// Legacy method name for backward compatibility
+    pub fn verify_engine_sanitization(&self) -> Result<bool> {
+        self.verify_engine_health()
+    }
+    
     /// Find Region of Interest (ROI) for attention-masked parsing
     /// 
     /// Uses fast AX tree scan to identify regions containing specific content
@@ -259,6 +519,326 @@ impl Cortex {
             max_x - min_x,
             max_y - min_y,
         )))
+    }
+    
+    /// Behavioral Engine - Human Jitter (Mouse & Scroll Entropy)
+    /// 
+    /// Phase 1: The "Human Jitter" replaces standard linear movement with
+    /// Gaussian Micro-Movements and Non-Linear Scrolling using the WindMouse
+    /// algorithm to simulate gravity, wind, and muscle tremors.
+    /// 
+    /// This replaces all direct CDP Input.dispatchMouseEvent calls with
+    /// a human-simulated trajectory.
+    
+    /// Human-like click with Gaussian Jitter and WindMouse algorithm
+    /// 
+    /// Uses Gaussian Micro-Movements to ensure no two movements between
+    /// Point A and Point B are ever identical. Implements 2-3 pixel
+    /// "overshoot and correction" pattern typical of human motor control.
+    /// 
+    /// Args:
+    ///   - target_x, target_y: Target coordinates
+    ///   - current_x, current_y: Current mouse position (optional)
+    ///   - precision: Precision value from Brain (lower = more human-like inaccuracy)
+    pub async fn human_click(
+        &self,
+        target_x: f64,
+        target_y: f64,
+        current_x: Option<f64>,
+        current_y: Option<f64>,
+        precision: Option<f64>, // 0.0 = low precision (more human), 1.0 = high precision
+    ) -> Result<()> {
+        let mut rng = rand::thread_rng();
+        
+        // Get current position or default to center
+        let (start_x, start_y) = match (current_x, current_y) {
+            (Some(x), Some(y)) => (x, y),
+            _ => (960.0, 540.0), // Default to center
+        };
+        
+        // Apply precision-based targeting offset
+        // Lower precision = more human-like inaccuracy (2-3 pixel overshoot)
+        let precision_val = precision.unwrap_or(0.3); // Default: 30% precision (70% human-like)
+        let max_offset = (1.0 - precision_val) * 5.0; // 0-5 pixels offset
+        
+        // Generate Gaussian jitter for target (human inaccuracy)
+        let jitter_dist = Normal::new(0.0, max_offset).unwrap();
+        let jitter_x = jitter_dist.sample(&mut rng);
+        let jitter_y = jitter_dist.sample(&mut rng);
+        
+        let adjusted_target_x = target_x + jitter_x;
+        let adjusted_target_y = target_y + jitter_y;
+        
+        debug!(
+            "Human click: ({:.1}, {:.1}) -> ({:.1}, {:.1}) [precision: {:.2}, jitter: ({:.2}, {:.2})]",
+            start_x, start_y, adjusted_target_x, adjusted_target_y, precision_val, jitter_x, jitter_y
+        );
+        
+        // Generate WindMouse trajectory (simulates gravity, wind, muscle tremors)
+        let trajectory = self.generate_windmouse_trajectory(
+            start_x, start_y,
+            adjusted_target_x, adjusted_target_y,
+        )?;
+        
+        // Execute trajectory with Gaussian micro-movements
+        for (x, y, delay) in trajectory {
+            // Add Gaussian tremor to each point (muscle jitter)
+            let tremor_dist = Normal::new(0.0, 0.5).unwrap(); // 0.5px standard deviation
+            let tremor_x = tremor_dist.sample(&mut rng);
+            let tremor_y = tremor_dist.sample(&mut rng);
+            
+            let final_x = x + tremor_x;
+            let final_y = y + tremor_y;
+            
+            self.tab.move_mouse(final_x, final_y)
+                .context("Failed to move mouse in trajectory")?;
+            
+            if !delay.is_zero() {
+                sleep(delay).await;
+            }
+        }
+        
+        // Hick's Law Latency: Variable "think time" before clicking
+        // Mimics human cognitive load required to process a page before clicking
+        let think_time = self.calculate_hicks_law_latency()?;
+        sleep(think_time).await;
+        
+        // Small pre-click pause (humans don't click instantly)
+        let pre_click_delay = rng.gen_range(50..150);
+        sleep(Duration::from_millis(pre_click_delay)).await;
+        
+        // Click
+        self.tab.click(headless_chrome::types::MouseButton::Left)
+            .context("Failed to click")?;
+        
+        // Variable hold time
+        let hold_time = rng.gen_range(50..200);
+        sleep(Duration::from_millis(hold_time)).await;
+        
+        debug!("Human click completed at ({:.1}, {:.1})", adjusted_target_x, adjusted_target_y);
+        Ok(())
+    }
+    
+    /// Human-like scroll with Non-Linear Entropy
+    /// 
+    /// Implements non-linear scrolling patterns that mimic human behavior:
+    /// - Variable scroll speed (acceleration/deceleration)
+    /// - Gaussian jitter in scroll distance
+    /// - Natural pauses during scrolling
+    pub async fn human_scroll(
+        &self,
+        delta_x: f64,
+        delta_y: f64,
+        current_x: Option<f64>,
+        current_y: Option<f64>,
+    ) -> Result<()> {
+        let mut rng = rand::thread_rng();
+        
+        // Get current position
+        let (scroll_x, scroll_y) = match (current_x, current_y) {
+            (Some(x), Some(y)) => (x, y),
+            _ => (960.0, 540.0),
+        };
+        
+        // Add Gaussian jitter to scroll distance (human inaccuracy)
+        let jitter_dist = Normal::new(0.0, delta_y.abs() * 0.1).unwrap();
+        let jitter = jitter_dist.sample(&mut rng);
+        let adjusted_delta_y = delta_y + jitter;
+        
+        debug!(
+            "Human scroll: delta_y={:.1} -> {:.1} (jitter: {:.2})",
+            delta_y, adjusted_delta_y, jitter
+        );
+        
+        // Break scroll into multiple steps with variable speed
+        // Humans don't scroll in one smooth motion
+        let steps = rng.gen_range(3..8);
+        let step_size = adjusted_delta_y / steps as f64;
+        
+        for i in 0..steps {
+            // Variable scroll speed (faster at start, slower at end)
+            let t = i as f64 / steps as f64;
+            let speed_factor = if t < 0.5 {
+                1.0 + (1.0 - t * 2.0) * 0.5 // Accelerate
+            } else {
+                1.0 - (t - 0.5) * 2.0 * 0.3 // Decelerate
+            };
+            
+            let step_delta = step_size * speed_factor;
+            
+            // Add micro-jitter to each step
+            let micro_jitter = rng.gen_range(-2.0..2.0);
+            let final_delta = step_delta + micro_jitter;
+            
+            self.tab.scroll(scroll_x, scroll_y, 0.0, final_delta)
+                .context("Failed to scroll")?;
+            
+            // Variable delay between scroll steps (humans pause)
+            let delay = rng.gen_range(20..80);
+            sleep(Duration::from_millis(delay)).await;
+        }
+        
+        debug!("Human scroll completed");
+        Ok(())
+    }
+    
+    /// Generate WindMouse trajectory
+    /// 
+    /// WindMouse algorithm simulates:
+    /// - Gravity (natural deceleration)
+    /// - Wind (random drift)
+    /// - Muscle tremors (Gaussian jitter)
+    /// 
+    /// This ensures no two movements are ever identical, avoiding
+    /// the "sharp peaks" characteristic of bots.
+    fn generate_windmouse_trajectory(
+        &self,
+        start_x: f64,
+        start_y: f64,
+        end_x: f64,
+        end_y: f64,
+    ) -> Result<Vec<(f64, f64, Duration)>> {
+        let mut rng = rand::thread_rng();
+        let distance = ((end_x - start_x).powi(2) + (end_y - start_y).powi(2)).sqrt();
+        
+        // Calculate number of steps based on distance
+        // More steps = smoother but slower
+        let steps = if distance < 100.0 {
+            rng.gen_range(10..20)
+        } else if distance < 500.0 {
+            rng.gen_range(20..35)
+        } else {
+            rng.gen_range(35..50)
+        };
+        
+        // WindMouse parameters
+        let gravity = 9.0; // Gravity strength
+        let wind = rng.gen_range(0.0..10.0); // Wind strength (random)
+        let max_step = 10.0; // Maximum step size
+        let target_area = 3.0; // Target area size (pixels)
+        
+        let mut trajectory = Vec::with_capacity(steps);
+        let mut current_x = start_x;
+        let mut current_y = start_y;
+        let mut velocity_x = 0.0;
+        let mut velocity_y = 0.0;
+        
+        for i in 0..steps {
+            let remaining_distance = ((end_x - current_x).powi(2) + (end_y - current_y).powi(2)).sqrt();
+            
+            // Check if we're close enough to target
+            if remaining_distance < target_area {
+                // Overshoot and correction pattern (2-3 pixels)
+                if remaining_distance > 1.0 {
+                    // Small overshoot
+                    let overshoot = rng.gen_range(2.0..4.0);
+                    let angle = (end_y - current_y).atan2(end_x - current_x);
+                    current_x += overshoot * angle.cos();
+                    current_y += overshoot * angle.sin();
+                    
+                    trajectory.push((current_x, current_y, Duration::from_millis(10)));
+                    
+                    // Correction back to target
+                    current_x = end_x + rng.gen_range(-1.0..1.0);
+                    current_y = end_y + rng.gen_range(-1.0..1.0);
+                    trajectory.push((current_x, current_y, Duration::from_millis(20)));
+                }
+                break;
+            }
+            
+            // Calculate wind effect (random drift)
+            let wind_x = wind * rng.gen_range(-1.0..1.0);
+            let wind_y = wind * rng.gen_range(-1.0..1.0);
+            
+            // Calculate gravity effect (towards target)
+            let gravity_x = (end_x - current_x) / remaining_distance * gravity;
+            let gravity_y = (end_y - current_y) / remaining_distance * gravity;
+            
+            // Update velocity
+            velocity_x += gravity_x + wind_x;
+            velocity_y += gravity_y + wind_y;
+            
+            // Limit velocity
+            let velocity_mag = (velocity_x.powi(2) + velocity_y.powi(2)).sqrt();
+            if velocity_mag > max_step {
+                velocity_x = velocity_x / velocity_mag * max_step;
+                velocity_y = velocity_y / velocity_mag * max_step;
+            }
+            
+            // Update position
+            current_x += velocity_x;
+            current_y += velocity_y;
+            
+            // Add Gaussian tremor (muscle jitter)
+            let tremor_dist = Normal::new(0.0, 0.3).unwrap();
+            let tremor_x = tremor_dist.sample(&mut rng);
+            let tremor_y = tremor_dist.sample(&mut rng);
+            
+            current_x += tremor_x;
+            current_y += tremor_y;
+            
+            // Calculate delay (variable speed)
+            let delay_ms = rng.gen_range(5..15);
+            trajectory.push((current_x, current_y, Duration::from_millis(delay_ms)));
+        }
+        
+        // Ensure we end at target (with small jitter)
+        if trajectory.is_empty() || {
+            let last = trajectory.last().unwrap();
+            let dist = ((end_x - last.0).powi(2) + (end_y - last.1).powi(2)).sqrt();
+            dist > target_area
+        } {
+            let final_jitter_x = rng.gen_range(-1.0..1.0);
+            let final_jitter_y = rng.gen_range(-1.0..1.0);
+            trajectory.push((
+                end_x + final_jitter_x,
+                end_y + final_jitter_y,
+                Duration::from_millis(10),
+            ));
+        }
+        
+        Ok(trajectory)
+    }
+    
+    /// Calculate Hick's Law Latency
+    /// 
+    /// Hick's Law: Reaction time = a + b * log2(n + 1)
+    /// Where n = number of choices/clickable elements
+    /// 
+    /// This mimics the human cognitive load required to process a page
+    /// before clicking. Instead of a fixed sleep, we use a distribution
+    /// that varies based on page complexity.
+    fn calculate_hicks_law_latency(&self) -> Result<Duration> {
+        // Get number of clickable elements from AX tree
+        let ax_tree = self.snapshot_accessibility_tree()?;
+        let clickable_count = ax_tree.nodes.iter()
+            .filter(|node| {
+                matches!(node.role.as_str(), "button" | "link" | "textbox" | "checkbox" | "radio")
+            })
+            .count();
+        
+        // Hick's Law formula
+        let a = 200.0; // Base reaction time (ms)
+        let b = 100.0; // Processing time per element (ms)
+        let n = clickable_count as f64;
+        
+        let base_time = a + b * (n + 1.0).log2();
+        
+        // Add randomness (humans are not perfectly consistent)
+        let mut rng = rand::thread_rng();
+        let variance = rng.gen_range(0.7..1.3); // 30% variance
+        let total_time = (base_time * variance) as u64;
+        
+        // Add jitter (0-150ms random delay)
+        let jitter = rng.gen_range(0..150);
+        let final_time = total_time + jitter;
+        
+        debug!(
+            "Hick's Law latency: {} clickable elements -> {}ms (base: {:.0}ms, variance: {:.2})",
+            clickable_count, final_time, base_time, variance
+        );
+        
+        Ok(Duration::from_millis(final_time))
     }
 }
 

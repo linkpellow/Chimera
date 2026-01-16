@@ -10,5 +10,7 @@ pub mod diffusion_mouse;
 pub mod cortex;
 pub mod world_model;
 pub mod identity_grafting;
+pub mod binary_patch;
+pub mod dbi;
 
 pub use error::{ChimeraError, Result};
