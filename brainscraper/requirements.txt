@@ -1,0 +1,23 @@
+# Brainscraper + Chimera Brain Unified Requirements
+# This combines the original brainscraper dependencies with Chimera AI dependencies
+
+# Core Python
+grpcio==1.60.0
+grpcio-tools==1.60.0
+protobuf==4.25.1
+
+# AI/ML Dependencies (Chimera Brain)
+torch>=2.0.0
+transformers>=4.35.0
+Pillow>=10.0.0
+numpy>=1.24.0
+accelerate>=0.25.0
+sentencepiece>=0.1.99
+
+# Hive Mind (Vector Experience Replay)
+redis==5.0.1
+redisearch==2.0.0
+sentence-transformers==2.2.2
+
+# Add your existing brainscraper dependencies here
+# (e.g., fastapi, uvicorn, requests, etc.)
