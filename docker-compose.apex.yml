@@ -1,0 +1,200 @@
+version: '3.8'
+
+# Chimera APEX - Scrapegoat Swarm Architecture
+# 
+# This is the production deployment for a distributed scraping swarm.
+# Each worker is powered by Chimera APEX technology.
+
+services:
+  # ============================================
+  # THE GENERAL (Control Center)
+  # ============================================
+  scrapegoat-orchestrator:
+    build:
+      context: ./scrapegoat-orchestrator
+      dockerfile: Dockerfile
+    image: scrapegoat/orchestrator:latest
+    container_name: scrapegoat-orchestrator
+    ports:
+      - "8080:8080"  # API endpoint
+      - "8081:8081"  # Metrics/health
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - DATABASE_URL=postgresql://scrapegoat:password@postgres:5432/scrapegoat
+      - LOG_LEVEL=info
+      - WORKER_POOL_SIZE=10
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./scrapegoat-data:/app/data
+    networks:
+      - scrapegoat-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ============================================
+  # THE SPINAL CORD (Shared Memory)
+  # ============================================
+  redis:
+    image: redis:7-alpine
+    container_name: scrapegoat-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    networks:
+      - scrapegoat-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ============================================
+  # DATABASE (Mission Logs)
+  # ============================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: scrapegoat-postgres
+    environment:
+      - POSTGRES_USER=scrapegoat
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=scrapegoat
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - scrapegoat-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scrapegoat"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # ============================================
+  # THE SOLDIERS (Chimera APEX Workers)
+  # ============================================
+  scrapegoat-worker:
+    build:
+      context: .
+      dockerfile: chimera-core/Dockerfile
+    image: chimera-apex:latest
+    container_name: scrapegoat-worker
+    deploy:
+      mode: replicated
+      replicas: 5  # Start with 5 workers, scale as needed
+    environment:
+      - MANAGER_URL=http://scrapegoat-orchestrator:8080
+      - REDIS_URL=redis://redis:6379
+      - CHIMERA_VISION_ADDR=http://chimera-brain:50052
+      - CHIMERA_AGENT_ADDR=0.0.0.0:50051
+      - STEALTH_LEVEL=apex
+      - IDENTITY_PROFILE=windows_chrome_124  # Rotate: windows_chrome, mac_safari, etc.
+    depends_on:
+      - redis
+      - scrapegoat-orchestrator
+      - chimera-brain
+    volumes:
+      - ./worker-data:/home/chimera/data
+    shm_size: '2gb'
+    networks:
+      - scrapegoat-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:50051/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ============================================
+  # THE BRAIN (Vision Service)
+  # ============================================
+  chimera-brain:
+    build:
+      context: ./chimera-brain
+      dockerfile: Dockerfile
+      # Uncomment for GPU support:
+      # target: gpu
+      # args:
+      #   CUDA_VERSION: "11.8"
+    image: chimera-brain:latest
+    container_name: chimera-brain
+    ports:
+      - "50052:50052"
+    environment:
+      - CHIMERA_VISION_PORT=50052
+      - CHIMERA_USE_SIMPLE=false
+      - CHIMERA_VISION_DEVICE=cpu
+      # For GPU: uncomment
+      # - CHIMERA_VISION_DEVICE=cuda
+    volumes:
+      - ~/.cache/huggingface:/home/chimera/.cache/huggingface:ro
+    networks:
+      - scrapegoat-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s = socket.socket(); s.connect(('localhost', 50052)); s.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # ============================================
+  # MONITORING (Optional)
+  # ============================================
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: scrapegoat-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - scrapegoat-network
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: scrapegoat-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - scrapegoat-network
+    restart: unless-stopped
+
+networks:
+  scrapegoat-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+
+volumes:
+  redis-data:
+    driver: local
+  postgres-data:
+    driver: local
+  prometheus-data:
+    driver: local
+  grafana-data:
+    driver: local

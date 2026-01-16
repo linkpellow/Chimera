@@ -1,0 +1,52 @@
+# Docker ignore file for Railway builds
+
+# Git
+.git
+.gitignore
+
+# Documentation
+*.md
+docs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# Rust
+target/
+Cargo.lock
+**/*.rs.bk
+
+# Node (if any)
+node_modules/
+npm-debug.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Railway
+.railway/
+
+# Test files
+*_test.rs
+*_test.py
+test/
+tests/
+
+# CI/CD
+.github/
+.gitlab-ci.yml

@@ -1,0 +1,89 @@
+version: '3.8'
+
+services:
+  # Chimera Brain - Vision Service (Python)
+  chimera-brain:
+    build:
+      context: ./chimera-brain
+      dockerfile: Dockerfile
+      # Uncomment for GPU support:
+      # target: gpu
+    image: chimera-brain:latest
+    container_name: chimera-brain
+    ports:
+      - "50052:50052"
+    environment:
+      - CHIMERA_VISION_PORT=50052
+      - CHIMERA_USE_SIMPLE=false
+      - CHIMERA_VISION_MODEL=
+      - CHIMERA_VISION_DEVICE=cpu
+      # For GPU: uncomment and set to cuda
+      # - CHIMERA_VISION_DEVICE=cuda
+    volumes:
+      # Mount model cache if using local models
+      - ~/.cache/huggingface:/home/chimera/.cache/huggingface:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import grpc; from chimera_brain import vision_pb2, vision_pb2_grpc; channel = grpc.insecure_channel('localhost:50052'); stub = vision_pb2_grpc.VisionServiceStub(channel); exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    networks:
+      - chimera-network
+
+  # Chimera Core - Agent Service (Rust)
+  chimera-core:
+    build:
+      context: .
+      dockerfile: chimera-core/Dockerfile
+    image: chimera-core:latest
+    container_name: chimera-core
+    ports:
+      - "50051:50051"
+    environment:
+      - CHIMERA_AGENT_ADDR=0.0.0.0:50051
+      - CHIMERA_VISION_ADDR=http://chimera-brain:50052
+    depends_on:
+      chimera-brain:
+        condition: service_healthy
+    volumes:
+      # Optional: Mount for persistent session data
+      - ./data:/home/chimera/data
+    # Security: Run as non-root user (already set in Dockerfile)
+    shm_size: '2gb'  # Increase shared memory for Chrome
+    restart: unless-stopped
+    networks:
+      - chimera-network
+
+  # Optional: REST API Wrapper
+  chimera-api:
+    build:
+      context: ./chimera-brain
+      dockerfile: Dockerfile
+    image: chimera-brain:latest
+    container_name: chimera-api
+    ports:
+      - "8080:8080"
+    environment:
+      - CHIMERA_API_PORT=8080
+      - CHIMERA_AGENT_ADDR=chimera-core:50051
+      - CHIMERA_VISION_ADDR=chimera-brain:50052
+    command: python /app/api_server.py
+    volumes:
+      - ./api_server.py:/app/api_server.py:ro
+    depends_on:
+      - chimera-core
+      - chimera-brain
+    restart: unless-stopped
+    networks:
+      - chimera-network
+
+networks:
+  chimera-network:
+    driver: bridge
+
+# Optional: Add volumes for persistent data
+volumes:
+  chimera-data:
+    driver: local

@@ -1,0 +1,120 @@
+syntax = "proto3";
+
+package chimera;
+
+// The main agent service
+service ChimeraAgent {
+    // Start a new browser session
+    rpc StartSession(StartSessionRequest) returns (StartSessionResponse);
+    
+    // Execute an action based on visual intent
+    rpc PerformAction(ActionRequest) returns (ActionResponse);
+    
+    // Get current screenshot/state
+    rpc GetState(GetStateRequest) returns (GetStateResponse);
+    
+    // Navigate to URL
+    rpc Navigate(NavigateRequest) returns (NavigateResponse);
+    
+    // Run a complete objective (high-level)
+    rpc RunObjective(ObjectiveRequest) returns (stream ObjectiveUpdate);
+    
+    // Close session
+    rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
+}
+
+// Vision service for coordinate detection
+service VisionService {
+    // Get coordinates for a visual intent
+    rpc GetCoordinates(CoordinateRequest) returns (CoordinateResponse);
+}
+
+// Request/Response types
+message StartSessionRequest {
+    string session_id = 1;
+    bool headless = 2;
+    map<string, string> options = 3;
+}
+
+message StartSessionResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message ActionRequest {
+    string session_id = 1;
+    string intent = 2;  // e.g., "Click the big green button"
+    ActionType action_type = 3;
+    optional string text = 4;  // For typing actions
+}
+
+enum ActionType {
+    CLICK = 0;
+    TYPE = 1;
+    SCROLL = 2;
+    WAIT = 3;
+}
+
+message ActionResponse {
+    bool success = 1;
+    string message = 2;
+    string new_state = 3;
+    bytes screenshot = 4;  // Updated screenshot after action
+}
+
+message GetStateRequest {
+    string session_id = 1;
+}
+
+message GetStateResponse {
+    bytes screenshot = 1;
+    string url = 2;
+    string title = 3;
+}
+
+message NavigateRequest {
+    string session_id = 1;
+    string url = 2;
+}
+
+message NavigateResponse {
+    bool success = 1;
+    string message = 2;
+}
+
+message ObjectiveRequest {
+    string session_id = 1;
+    string start_url = 2;
+    string instruction = 3;
+    bool headless = 4;
+}
+
+message ObjectiveUpdate {
+    string status = 1;  // "observing", "thinking", "acting", "verifying", "complete", "error"
+    string message = 2;
+    bytes screenshot = 3;
+    optional ActionResponse last_action = 4;
+}
+
+message CloseSessionRequest {
+    string session_id = 1;
+}
+
+message CloseSessionResponse {
+    bool success = 1;
+}
+
+// Vision service messages
+message CoordinateRequest {
+    bytes image = 1;
+    string text_command = 2;
+}
+
+message CoordinateResponse {
+    bool found = 1;
+    int32 x = 2;
+    int32 y = 3;
+    int32 width = 4;
+    int32 height = 5;
+    float confidence = 6;
+}
