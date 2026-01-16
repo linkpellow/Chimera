@@ -89,15 +89,18 @@ impl BrowserSession {
                 }
             });
             
-            // Native CDP Override: Hardcode WebGL Vendor and Renderer
-            // This ensures the sanitized binary reports authentic consumer hardware
-            // even in a virtualized container environment.
+            // Deep GPU Parameter Masking - Phase 4: Network-Layer Authenticity
+            // Standard masking only touches Vendor/Renderer names. High-level probes
+            // now inspect WebGL technical limits to see if they match server-grade hardware.
             // 
-            // Success Criterion:
-            // - Vendor: "Intel Inc."
-            // - Renderer: "Intel(R) Iris(R) Xe Graphics"
+            // We must hardcode WebGL parameters to match consumer hardware:
+            // - MAX_TEXTURE_SIZE: 16384 (consumer GPU limit, not server-grade 32768+)
+            // - MAX_RENDERBUFFER_SIZE: 16384 (consumer GPU limit)
+            // - UNMASKED_VENDOR_WEBGL: "Intel Inc."
+            // - UNMASKED_RENDERER_WEBGL: "Intel(R) Iris(R) Xe Graphics"
             //
-            // This prevents GPU fingerprinting from revealing server hardware (SwiftShader/Linux GPU)
+            // This prevents high-level probes from detecting server-grade hardware
+            // by inspecting WebGL technical limits.
             const originalGetParameter = WebGLRenderingContext.prototype.getParameter;
             WebGLRenderingContext.prototype.getParameter = function(parameter) {
                 // UNMASKED_VENDOR_WEBGL (0x9245 = 37445)
@@ -108,15 +111,25 @@ impl BrowserSession {
                 if (parameter === 37446) {
                     return "Intel(R) Iris(R) Xe Graphics";
                 }
+                // MAX_TEXTURE_SIZE (0x0D33 = 3379)
+                if (parameter === 3379) {
+                    return 16384; // Consumer GPU limit (not server-grade 32768+)
+                }
+                // MAX_RENDERBUFFER_SIZE (0x84E8 = 34024)
+                if (parameter === 34024) {
+                    return 16384; // Consumer GPU limit
+                }
                 return originalGetParameter.call(this, parameter);
             };
             
-            // Also override WebGL2 (if available)
+            // Also override WebGL2 (if available) with same parameters
             if (typeof WebGL2RenderingContext !== 'undefined') {
                 const originalGetParameter2 = WebGL2RenderingContext.prototype.getParameter;
                 WebGL2RenderingContext.prototype.getParameter = function(parameter) {
                     if (parameter === 37445) return "Intel Inc.";
                     if (parameter === 37446) return "Intel(R) Iris(R) Xe Graphics";
+                    if (parameter === 3379) return 16384; // MAX_TEXTURE_SIZE
+                    if (parameter === 34024) return 16384; // MAX_RENDERBUFFER_SIZE
                     return originalGetParameter2.call(this, parameter);
                 };
             }

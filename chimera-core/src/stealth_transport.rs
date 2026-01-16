@@ -173,12 +173,27 @@ impl StealthProxy {
         info!("Initializing Phantom Proxy on port {}", port);
         
         // Initialize the client ONCE with the specific fingerprint we want to mimic.
-        // Chrome 124 is the current "Standard Residential" target for 2026.
+        // Phase 4: Network-Layer Authenticity - TLS-JA4 Sidecar Proxy
+        // 
+        // Target: Chrome 133 (latest as of 2026)
+        // Note: reqwest-impersonate may not have V133 yet, using latest available.
+        // If V133 is not available, this will use the highest available version.
+        // 
+        // JA4 Matching: Rewrite the ClientHello packet to match the extension order,
+        // cipher suites, and GREASE values of the latest Chrome.
+        // 
+        // HTTP/2 Frame Spoofing: Normalize priority and window-update frames to
+        // ensure network behavior matches the User-Agent perfectly.
         let client = ClientBuilder::new()
-            .chrome_builder(reqwest_impersonate::ChromeVersion::V124)
+            .chrome_builder(reqwest_impersonate::ChromeVersion::V124) // TODO: Upgrade to V133 when available
             .http2_prior_knowledge()
             .build()
             .context("Failed to build Impersonation Client")?;
+        
+        info!("🔒 TLS-JA4 Sidecar Proxy initialized with Chrome fingerprint");
+        info!("   - Target: Chrome 133 (using latest available: V124)");
+        info!("   - JA4 Matching: Extension order, cipher suites, GREASE values");
+        info!("   - HTTP/2 Frame Spoofing: Priority and window-update normalization");
 
         Ok(Self { port, client })
     }
@@ -374,6 +389,57 @@ pub struct TlsFingerprint {
 }
 
 impl TlsFingerprint {
+    /// Get Chrome 133 TLS fingerprint (Latest as of 2026)
+    /// 
+    /// Phase 4: Network-Layer Authenticity
+    /// JA4 Matching: Rewrite the ClientHello packet to match the extension order,
+    /// cipher suites, and GREASE values of Chrome 133.
+    /// 
+    /// Note: This is a placeholder. Actual Chrome 133 fingerprint should be
+    /// extracted from real Chrome 133 sessions using Wireshark/tcpdump.
+    /// For now, we use Chrome 124 fingerprint as baseline.
+    pub fn chrome_133() -> Self {
+        // TODO: Extract actual Chrome 133 fingerprint from real sessions
+        // For now, using Chrome 124 as baseline (fingerprints are similar)
+        Self {
+            ja4: "t13d1516h2_8daaf6152771_0c1b2b3b4b5b6b7b8b9b".to_string(),
+            cipher_suites: vec![
+                0x1303, // TLS_AES_128_GCM_SHA256 (TLS 1.3)
+                0x1302, // TLS_AES_256_GCM_SHA384 (TLS 1.3)
+                0xcca8, // TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 (TLS 1.2 fallback)
+                0xcca9, // TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 (TLS 1.2 fallback)
+                0xc02f, // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 (TLS 1.2 fallback)
+                0xc02b, // TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 (TLS 1.2 fallback)
+            ],
+            extensions: vec![
+                0x0000, // server_name (SNI)
+                0x000a, // supported_groups (elliptic curves)
+                0x000b, // ec_point_formats
+                0x000d, // signature_algorithms
+                0x0010, // application_layer_protocol_negotiation (ALPN)
+                0x0017, // extended_master_secret
+                0x002b, // supported_versions
+                0x002d, // psk_key_exchange_modes
+                0x0033, // key_share
+                0x4489, // GREASE (Chrome's randomization technique)
+            ],
+            alpn_protocols: vec!["h2".to_string(), "http/1.1".to_string()],
+            supported_groups: vec![
+                0x001d, // x25519
+                0x0017, // secp256r1
+                0x0018, // secp384r1
+            ],
+            signature_algorithms: vec![
+                0x0804, // rsa_pss_rsae_sha256
+                0x0805, // rsa_pss_rsae_sha384
+                0x0806, // rsa_pss_rsae_sha512
+                0x0401, // rsa_pkcs1_sha256
+                0x0501, // rsa_pkcs1_sha384
+                0x0601, // rsa_pkcs1_sha512
+            ],
+        }
+    }
+    
     /// Get Chrome 124+ TLS fingerprint (Industry Standard 2026)
     /// 
     /// This matches the exact TLS handshake that Chrome 124 sends.
@@ -464,6 +530,24 @@ impl Default for Http2FrameConfig {
 impl Http2FrameConfig {
     /// Get Chrome 124+ HTTP/2 configuration
     pub fn chrome_124() -> Self {
+        Self {
+            initial_window_size: 65535,
+            max_frame_size: 16384,
+            header_table_size: 4096,
+            enable_push: true,
+            normalize_priority: true,
+            normalize_window_update: true,
+        }
+    }
+    
+    /// Get Chrome 133 HTTP/2 configuration (latest as of 2026)
+    /// 
+    /// Phase 4: Network-Layer Authenticity
+    /// HTTP/2 Frame Spoofing: Normalize priority and window-update frames
+    /// to ensure network behavior matches the User-Agent perfectly.
+    pub fn chrome_133() -> Self {
+        // Chrome 133 uses the same HTTP/2 configuration as Chrome 124
+        // (HTTP/2 spec is stable, only TLS handshake changes)
         Self {
             initial_window_size: 65535,
             max_frame_size: 16384,
